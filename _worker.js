@@ -1,3 +1,6 @@
+  let NOTES, SHARE, SALT, SECRET, LIST_SECRET;
+  // 新增：用于记录错误次数的内存黑名单
+  const ipFailMap = new Map(); 
   var __create = Object.create;
   var __defProp = Object.defineProperty;
   var __getOwnPropDesc = Object.getOwnPropertyDescriptor;
@@ -586,8 +589,6 @@
 
   // src/constant.js
   var CDN_PREFIX = "//gcore.jsdelivr.net/gh/s0urcelab/serverless-cloud-notepad@master/static";
-  var SALT = SCN_SALT;
-  var SECRET = SCN_SECRET;
   var SUPPORTED_LANG = {
     "en": {
       setPW: "Set Password",
@@ -721,7 +722,8 @@
   }
   async function MD5(str) {
     const msgUint8 = new TextEncoder().encode(str);
-    const hashBuffer = await crypto.subtle.digest("MD5", msgUint8);
+    // 将 MD5 替换为标准的 SHA-256 加密
+    const hashBuffer = await crypto.subtle.digest("SHA-256", msgUint8);
     const hashArray = Array.from(new Uint8Array(hashBuffer));
     return hashArray.map((b) => b.toString(16).padStart(2, "0")).join("");
   }
@@ -761,50 +763,90 @@
     const newHash = genRandomStr(3);
     return Response.redirect(`${url}${newHash}`, 302);
   });
-  router.get("/list", async () => {
-    const keys = await NOTES.list();
-    const rows = keys.keys.map((key) => `
-      <tr>
-        <td><a href="/${key.name}">${key.name}</a></td>
-        <td>${key.metadata ? (() => {
-      const date = new Date(key.metadata.updateAt * 1e3);
-      const pad = (num) => num.toString().padStart(2, "0");
-      return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
-    })() : "N/A"}
-        </td>
-      </tr>
-    `).join("<br>");
-    const html = `
-      <!DOCTYPE html>
-      <html>
-        <head>
-          <title>Note List</title>
-          <style>
-            body { font-family: Arial, sans-serif; padding: 20px; }
-            table { width: 100%; border-collapse: collapse; }
-            th, td { padding: 10px; border: 1px solid #ddd; text-align: left; }
-            th { background-color: #f4f4f4; }
-          </style>
-        </head>
-        <body>
-          <h1>Note List</h1>
-          <table>
-            <thead>
-              <tr>
-                <th>Note Link</th>
-                <th>Modify Time</th>
-              </tr>
-            </thead>
-            <tbody>
-              ${rows}
-            </tbody>
-          </table>
-        </body>
-      </html>`;
-    return new Response(html, {
-      headers: { "Content-Type": "text/html" }
+  router.get("/list", async (request) => {
+  // 1. 检查环境变量，若未配置则直接拒绝访问
+  if (!LIST_SECRET) {
+    return new Response("List view is disabled by administrator.", { status: 403 });
+  }
+
+  // 2. HTTP Basic Auth 拦截与校验
+  const authHeader = request.headers.get('Authorization');
+  if (!authHeader) {
+    // 触发浏览器原生密码输入框
+    return new Response('Unauthorized', {
+      status: 401,
+      headers: { 'WWW-Authenticate': 'Basic realm="Admin"' }
     });
+  }
+
+  try {
+    const [scheme, encoded] = authHeader.split(' ');
+    if (scheme !== 'Basic' || !encoded) {
+      throw new Error('Malformed auth');
+    }
+    
+    // 解析 Base64 编码的账号密码 (格式为 username:password)
+    const decoded = atob(encoded);
+    const index = decoded.indexOf(':');
+    const password = decoded.substring(index + 1);
+
+    // 校验密码是否与 LIST_SECRET 一致 (账号名可随意填写，仅校验密码)
+    if (password !== LIST_SECRET) {
+      return new Response('Unauthorized', {
+        status: 401,
+        headers: { 'WWW-Authenticate': 'Basic realm="Admin"' }
+      });
+    }
+  } catch (err) {
+    return new Response('Bad Request', { status: 400 });
+  }
+
+  // 3. 校验通过，执行原有的列表渲染逻辑
+  const keys = await NOTES.list();
+  const rows = keys.keys.map((key) => `
+    <tr>
+      <td><a href="/${key.name}">${key.name}</a></td>
+      <td>${key.metadata ? (() => {
+    const date = new Date(key.metadata.updateAt * 1e3);
+    const pad = (num) => num.toString().padStart(2, "0");
+    return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
+  })() : "N/A"}
+      </td>
+    </tr>
+  `).join("<br>");
+  
+  const html = `
+    <!DOCTYPE html>
+    <html>
+      <head>
+        <title>Note List</title>
+        <style>
+          body { font-family: Arial, sans-serif; padding: 20px; }
+          table { width: 100%; border-collapse: collapse; }
+          th, td { padding: 10px; border: 1px solid #ddd; text-align: left; }
+          th { background-color: #f4f4f4; }
+        </style>
+      </head>
+      <body>
+        <h1>Note List</h1>
+        <table>
+          <thead>
+            <tr>
+              <th>Note Link</th>
+              <th>Modify Time</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${rows}
+          </tbody>
+        </table>
+      </body>
+    </html>`;
+    
+  return new Response(html, {
+    headers: { "Content-Type": "text/html" }
   });
+});
   router.get("/share/:md5", async (request) => {
     const lang = getI18n(request);
     const { md5 } = request.params;
@@ -847,16 +889,33 @@
   });
   router.post("/:path/auth", async (request) => {
     const { path } = request.params;
+    const ip = request.headers.get("cf-connecting-ip") || "unknown_ip";
+    const blockKey = `BLOCK_${ip}`;
+    const failsKey = `FAILS_${ip}`;
+
+    // 1. 全局 KV 拦截网
+    if (await SHARE.get(blockKey)) {
+      return new Response(
+        JSON.stringify({ err: 429, msg: "Too many failed attempts. Try again later." }),
+        { status: 429, headers: { "content-type": "application/json;charset=UTF-8" } }
+      );
+    }
+
+    // 2. 焦油坑：强行挂起0.5秒，拖慢爆破
+    await new Promise(resolve => setTimeout(resolve, 500));
+
     if (request.headers.get("Content-Type") === "application/json") {
       const { passwd } = await request.json();
       const { metadata } = await queryNote(path);
+      
       if (metadata.pw) {
         const storePw = await saltPw(passwd);
         if (metadata.pw === storePw) {
+          // 密码正确：清除错误计数
+          await SHARE.delete(failsKey);
+          
           const token = await import_cloudflare_worker_jwt2.default.sign({ path }, SECRET);
-          return returnJSON(0, {
-            refresh: true
-          }, {
+          return returnJSON(0, { refresh: true }, {
             "Set-Cookie": import_cookie.default.serialize("auth", token, {
               path: `/${path}`,
               expires: (0, import_dayjs2.default)().add(7, "day").toDate(),
@@ -866,6 +925,20 @@
         }
       }
     }
+
+    // 3. 密码错误逻辑：写入 KV 并累计
+    let fails = parseInt(await SHARE.get(failsKey) || "0");
+    fails++;
+    
+    if (fails >= 5) {
+      // 达到阈值：将该 IP 封禁 24 小时
+      await SHARE.put(blockKey, "1", { expirationTtl: 86400 });
+      await SHARE.delete(failsKey);
+    } else {
+      // 未达阈值：记录错误次数，60秒内有效
+      await SHARE.put(failsKey, fails.toString(), { expirationTtl: 60 });
+    }
+
     return returnJSON(10002, "Password auth failed!");
   });
   router.post("/:path/pw", async (request) => {
@@ -960,16 +1033,22 @@
   });
   export default {
   async fetch(request, env, ctx) {
-    // 将 Pages 传入的环境变量和 KV 绑定挂载到全局，兼容原有的全局调用逻辑
-    globalThis.NOTES = env.NOTES;
-    globalThis.SHARE = env.SHARE;
-    globalThis.SCN_SALT = env.SCN_SALT;
-    globalThis.SCN_SECRET = env.SCN_SECRET;
+    // 正常赋值流程
+    NOTES = env.NOTES;
+    SHARE = env.SHARE;
+    SALT = env.SCN_SALT;
+    SECRET = env.SCN_SECRET;
+    // 新增：读取后台配置的列表密码
+    LIST_SECRET = env.LIST_SECRET; 
+
+    // 兼容原版代码的全局调用
+    globalThis.NOTES = NOTES;
+    globalThis.SHARE = SHARE;
 
     try {
       return await router.handle(request);
     } catch (err) {
-      return new Response("Internal Error: " + err.message, { status: 500 });
+      return returnJSON(500, "Internal Error: " + err.message);
     }
   }
 };
@@ -983,4 +1062,3 @@ cookie/index.js:
    * MIT Licensed
    *)
 */
-//# sourceMappingURL=index.js.map
